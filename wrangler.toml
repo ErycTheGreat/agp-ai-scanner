@@ -18,3 +18,10 @@ binding = "AI"
 
 [browser]
 binding = "MYBROWSER"
+
+# --- AI & BROWSER LOGGING ---
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
