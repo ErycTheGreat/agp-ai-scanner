@@ -1,6 +1,6 @@
 import puppeteer from "@cloudflare/puppeteer";
 
-// 1. The Core AI Logic (Isolated so it can be triggered two ways)
+// 1. The Core AI Logic (Now with DOM Pruning)
 async function extractPayload(env) {
     console.log("Starting Asymmetric Ghost Payload Generation...");
     
@@ -9,7 +9,18 @@ async function extractPayload(env) {
     
     await page.goto("https://sites.google.com/view/eryc-tri-juni-s-notes/");
     await page.waitForNetworkIdle(); 
-    const computedHTML = await page.content();
+    
+    // 🚨 THE FIX: PRUNE THE HTML BLOAT BEFORE EXTRACTING
+    const cleanHTML = await page.evaluate(() => {
+        // 1. Nuke scripts, styles, svgs, iframes, and noscript tags
+        document.querySelectorAll('script, style, svg, path, symbol, iframe, noscript').forEach(e => e.remove());
+        // 2. Nuke massive Google Sites JSON data blobs
+        document.querySelectorAll('div[data-code]').forEach(e => e.remove());
+        
+        // 3. Return only the top section of the body where the LCP lives, strictly capped at 20,000 characters (~5,000 tokens)
+        return document.body.innerHTML.substring(0, 20000);
+    });
+    
     await browser.close();
 
     const systemPrompt = `You are an Edge SEO extraction tool. 
@@ -19,11 +30,11 @@ async function extractPayload(env) {
     "criticalCss" (string, a minified CSS string replicating the primary above-the-fold layout and background colors). 
     Do not include markdown formatting or explanations. Keep CSS under 500 characters.`;
 
-    console.log("Sending DOM to Llama 3...");
+    console.log("Sending Cleaned DOM to Llama 3...");
     const aiResponse = await env.AI.run('@cf/meta/llama-3-8b-instruct', {
         messages: [
         { role: "system", content: systemPrompt },
-        { role: "user", content: computedHTML }
+        { role: "user", content: cleanHTML } // <--- Passing the pruned HTML
         ]
     });
 
