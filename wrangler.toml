@@ -1,0 +1,20 @@
+name = "agp-ai-scanner"
+main = "index.js"
+compatibility_date = "2026-04-14"
+compatibility_flags = ["nodejs_compat"]
+
+# Wake up and run every 12 hours
+[triggers]
+crons = ["0 */12 * * *"]
+
+# The bucket where it drops the payload
+[[kv_namespaces]]
+binding = "AGP_STATE"
+id = "9a9985fe64c34f6ea7eb41de408ccbcd"
+
+# Activate the AI and Browser
+[ai]
+binding = "AI"
+
+[browser]
+binding = "MYBROWSER"
