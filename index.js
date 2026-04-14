@@ -1,115 +1,96 @@
 import puppeteer from "@cloudflare/puppeteer";
 
-// 1. The Core AI Logic
 async function extractPayload(env) {
     console.log("Starting Asymmetric Ghost Payload Generation...");
-    
-    const browser = await puppeteer.launch(env.MYBROWSER);
-    const page = await browser.newPage();
-    
-    console.log("Navigating to site...");
-    await page.goto("https://sites.google.com/view/eryc-tri-juni-s-notes/");
-    
-    // 🚨 FIX 1: THE HARD WAIT. Google Sites is notoriously slow to paint.
-    // 'networkidle' sometimes fires too early. We force it to wait 3 extra seconds.
-    await new Promise(r => setTimeout(r, 3000));
-    
-    // 🚨 FIX 2: PRUNE THE HTML BLOAT
-    const cleanHTML = await page.evaluate(() => {
-        document.querySelectorAll('script, style, svg, path, symbol, iframe, noscript').forEach(e => e.remove());
-        document.querySelectorAll('div[data-code]').forEach(e => e.remove());
-        // Added safety check in case document.body is missing
-        return document.body ? document.body.innerHTML.substring(0, 15000) : "";
-    });
-    
-    await browser.close();
+    let browser; // Declare outside the try block so 'finally' can access it
 
-    // 🚨 FIX 3: DIAGNOSTIC LOG. Let's see if the browser actually grabbed your site!
-    console.log("Clean HTML Length grabbed by browser:", cleanHTML.length);
-    
-    if (cleanHTML.length < 100) {
-        throw new Error("Puppeteer grabbed a blank page. Google Sites is loading too slowly.");
-    }
-
-    const systemPrompt = `You are an Edge SEO extraction tool. 
-    Analyze the provided HTML. Output ONLY a valid JSON object. 
-    Required keys: 
-    "lcpUrl" (string, the absolute URL of the primary hero image), 
-    "criticalCss" (string, a minified CSS string replicating the primary above-the-fold layout and background colors). 
-    Do not include markdown formatting or explanations. Keep CSS under 500 characters.`;
-
-    console.log("Sending Cleaned DOM to Llama 3...");
-    const aiResponse = await env.AI.run('@cf/meta/llama-3-8b-instruct', {
-        messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: cleanHTML }
-        ]
-    });
-
-    // 🚨 FIX 4: BLANK RESPONSE CATCHER
-    let rawText = aiResponse.response || "";
-    console.log("Raw AI Output:", rawText);
-    
-    if (!rawText.trim()) {
-        throw new Error("Llama-3 returned a completely blank response. The HTML might be confusing the model.");
-    }
-
-    // 🚨 FIX 5: BULLETPROOF JSON EXTRACTOR
-    let parsedData = {};
     try {
+        browser = await puppeteer.launch(env.MYBROWSER);
+        const page = await browser.newPage();
+        
+        console.log("Navigating to site...");
+        await page.goto("https://sites.google.com/view/eryc-tri-juni-s-notes/");
+        await new Promise(r => setTimeout(r, 3000));
+        
+        // 🚨 EXTREME PRUNING: Strip the Google Gibberish
+        const cleanHTML = await page.evaluate(() => {
+            document.querySelectorAll('script, style, svg, path, symbol, iframe, noscript').forEach(e => e.remove());
+            document.querySelectorAll('div[data-code]').forEach(e => e.remove());
+            
+            // Strip all class names and IDs to save massive amounts of tokens
+            const elements = document.body.getElementsByTagName('*');
+            for (let i = 0; i < elements.length; i++) {
+                elements[i].removeAttribute('class');
+                elements[i].removeAttribute('id');
+                elements[i].removeAttribute('jsname');
+                elements[i].removeAttribute('jsaction');
+            }
+            // Cut it down to a tiny 8,000 characters
+            return document.body ? document.body.innerHTML.substring(0, 8000) : "";
+        });
+
+        console.log("Clean HTML Length:", cleanHTML.length);
+        if (cleanHTML.length < 100) throw new Error("Browser grabbed a blank page.");
+
+        // 🚨 SIMPLIFIED PROMPT: Just get the color and image!
+        const systemPrompt = `Analyze the HTML. Output ONLY a valid JSON object. 
+        Required keys: 
+        "lcpUrl" (string, the URL of the largest hero image or profile picture). 
+        "bgColor" (string, the primary background color hex code, default to "#020617" if unsure). 
+        Do not include markdown or explanations. Just raw JSON.`;
+
+        console.log("Sending Cleaned DOM to Llama 3...");
+        const aiResponse = await env.AI.run('@cf/meta/llama-3-8b-instruct', {
+            messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: cleanHTML }
+            ]
+        });
+
+        let rawText = aiResponse.response || "";
+        console.log("Raw AI Output:", rawText);
+        
+        if (!rawText.trim()) throw new Error("AI returned a blank response.");
+
+        // Extract JSON
         rawText = rawText.replace(/```json/gi, "").replace(/```/g, "").trim();
         const firstBrace = rawText.indexOf("{");
         const lastBrace = rawText.lastIndexOf("}");
+        if (firstBrace === -1 || lastBrace === -1) throw new Error("No JSON brackets found.");
         
-        if (firstBrace === -1 || lastBrace === -1) {
-            throw new Error("No JSON brackets found in the response.");
+        const parsedData = JSON.parse(rawText.substring(firstBrace, lastBrace + 1));
+            
+        // 1. Save the Image
+        if (parsedData.lcpUrl && parsedData.lcpUrl.length < 500 && parsedData.lcpUrl.startsWith("http")) {
+            await env.AGP_STATE.put("LCP_IMAGE_URL", parsedData.lcpUrl);
         }
-        
-        const cleanJsonString = rawText.substring(firstBrace, lastBrace + 1);
-        parsedData = JSON.parse(cleanJsonString);
-        
-    } catch (parseError) {
-        console.error("CRITICAL: AI failed to output valid JSON. See raw output above.");
-        throw new Error("JSON Parsing failed. The AI output was malformed.");
-    }
-        
-    // Validate LCP
-    if (parsedData.lcpUrl && parsedData.lcpUrl.length < 500 && parsedData.lcpUrl.startsWith("http")) {
-        await env.AGP_STATE.put("LCP_IMAGE_URL", parsedData.lcpUrl);
-    }
 
-    // Validate CSS
-    let safeCss = "";
-    if (parsedData.criticalCss) {
-        if (parsedData.criticalCss.length > 1500) {
-            safeCss = "body { background-color: #020617; } .ghost-skeleton { width: 100vw; height: 100vh; }";
-        } else {
-            safeCss = parsedData.criticalCss;
-        }
-    }
-
-    if (safeCss) {
+        // 2. Build the CSS Manually (No AI hallucinations possible here!)
+        const bgColor = parsedData.bgColor || "#020617";
+        const safeCss = `body { background-color: ${bgColor} !important; } .ghost-skeleton { width: 100vw; height: 100vh; background-color: ${bgColor}; }`;
+        
         await env.AGP_STATE.put("GHOST_CSS", safeCss);
+        console.log("AGP State Updated Successfully in KV.");
+
+    } finally {
+        // 🚨 THE SESSION FIX: Always close the browser, even if it crashes
+        if (browser) {
+            console.log("Closing browser session...");
+            await browser.close();
+        }
     }
 }
 
 export default {
-  // 2. The Standard Cron Trigger (Runs automatically in the background)
   async scheduled(event, env, ctx) {
-    try {
-        await extractPayload(env);
-    } catch (error) {
-        console.error("Cron AI Extraction Failed:", error);
-    }
+    try { await extractPayload(env); } catch (e) { console.error("Cron AI Failed:", e); }
   },
-  
-  // 3. THE MANUAL OVERRIDE (Runs when you click the worker link)
   async fetch(request, env, ctx) {
     try {
         await extractPayload(env);
-        return new Response("AI Scanner executed successfully! Go check your KV Database.", { status: 200 });
-    } catch (error) {
-        return new Response("AI Scanner Failed. Error: " + error.message, { status: 500 });
+        return new Response("AI Scanner executed successfully! Check KV.", { status: 200 });
+    } catch (e) {
+        return new Response("AI Scanner Failed. Error: " + e.message, { status: 500 });
     }
   }
 };
