@@ -1,0 +1,8 @@
+{
+  "name": "agp-ai-scanner",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@cloudflare/puppeteer": "latest"
+  }
+}
