@@ -1,27 +1,35 @@
 import puppeteer from "@cloudflare/puppeteer";
 
-// 1. The Core AI Logic (Now with DOM Pruning)
+// 1. The Core AI Logic
 async function extractPayload(env) {
     console.log("Starting Asymmetric Ghost Payload Generation...");
     
     const browser = await puppeteer.launch(env.MYBROWSER);
     const page = await browser.newPage();
     
+    console.log("Navigating to site...");
     await page.goto("https://sites.google.com/view/eryc-tri-juni-s-notes/");
-    await page.waitForNetworkIdle(); 
     
-    // 🚨 THE FIX: PRUNE THE HTML BLOAT BEFORE EXTRACTING
+    // 🚨 FIX 1: THE HARD WAIT. Google Sites is notoriously slow to paint.
+    // 'networkidle' sometimes fires too early. We force it to wait 3 extra seconds.
+    await new Promise(r => setTimeout(r, 3000));
+    
+    // 🚨 FIX 2: PRUNE THE HTML BLOAT
     const cleanHTML = await page.evaluate(() => {
-        // 1. Nuke scripts, styles, svgs, iframes, and noscript tags
         document.querySelectorAll('script, style, svg, path, symbol, iframe, noscript').forEach(e => e.remove());
-        // 2. Nuke massive Google Sites JSON data blobs
         document.querySelectorAll('div[data-code]').forEach(e => e.remove());
-        
-        // 3. Return only the top section of the body where the LCP lives, strictly capped at 20,000 characters (~5,000 tokens)
-        return document.body.innerHTML.substring(0, 20000);
+        // Added safety check in case document.body is missing
+        return document.body ? document.body.innerHTML.substring(0, 15000) : "";
     });
     
     await browser.close();
+
+    // 🚨 FIX 3: DIAGNOSTIC LOG. Let's see if the browser actually grabbed your site!
+    console.log("Clean HTML Length grabbed by browser:", cleanHTML.length);
+    
+    if (cleanHTML.length < 100) {
+        throw new Error("Puppeteer grabbed a blank page. Google Sites is loading too slowly.");
+    }
 
     const systemPrompt = `You are an Edge SEO extraction tool. 
     Analyze the provided HTML. Output ONLY a valid JSON object. 
@@ -34,20 +42,22 @@ async function extractPayload(env) {
     const aiResponse = await env.AI.run('@cf/meta/llama-3-8b-instruct', {
         messages: [
         { role: "system", content: systemPrompt },
-        { role: "user", content: cleanHTML } // <--- Passing the pruned HTML
+        { role: "user", content: cleanHTML }
         ]
     });
 
-    // 🚨 THE JSON EXTRACTOR: Bulletproof parsing
+    // 🚨 FIX 4: BLANK RESPONSE CATCHER
+    let rawText = aiResponse.response || "";
+    console.log("Raw AI Output:", rawText);
+    
+    if (!rawText.trim()) {
+        throw new Error("Llama-3 returned a completely blank response. The HTML might be confusing the model.");
+    }
+
+    // 🚨 FIX 5: BULLETPROOF JSON EXTRACTOR
     let parsedData = {};
     try {
-        let rawText = aiResponse.response;
-        console.log("Raw AI Output:", rawText); // Prints to logs so we can see what it actually said
-        
-        // 1. Strip markdown backticks if Llama hallucinated them
         rawText = rawText.replace(/```json/gi, "").replace(/```/g, "").trim();
-        
-        // 2. Find the exact start and end of the JSON object
         const firstBrace = rawText.indexOf("{");
         const lastBrace = rawText.lastIndexOf("}");
         
@@ -55,7 +65,6 @@ async function extractPayload(env) {
             throw new Error("No JSON brackets found in the response.");
         }
         
-        // 3. Cut out just the pure JSON string and parse it
         const cleanJsonString = rawText.substring(firstBrace, lastBrace + 1);
         parsedData = JSON.parse(cleanJsonString);
         
@@ -94,13 +103,12 @@ export default {
     }
   },
   
-  // 🚨 3. THE MANUAL OVERRIDE (Runs when you click the worker link)
+  // 3. THE MANUAL OVERRIDE (Runs when you click the worker link)
   async fetch(request, env, ctx) {
     try {
         await extractPayload(env);
         return new Response("AI Scanner executed successfully! Go check your KV Database.", { status: 200 });
     } catch (error) {
-        // If it fails, it will print the exact error on your screen!
         return new Response("AI Scanner Failed. Error: " + error.message, { status: 500 });
     }
   }
