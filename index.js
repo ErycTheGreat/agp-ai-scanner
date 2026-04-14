@@ -38,7 +38,31 @@ async function extractPayload(env) {
         ]
     });
 
-    const parsedData = JSON.parse(aiResponse.response);
+    // 🚨 THE JSON EXTRACTOR: Bulletproof parsing
+    let parsedData = {};
+    try {
+        let rawText = aiResponse.response;
+        console.log("Raw AI Output:", rawText); // Prints to logs so we can see what it actually said
+        
+        // 1. Strip markdown backticks if Llama hallucinated them
+        rawText = rawText.replace(/```json/gi, "").replace(/```/g, "").trim();
+        
+        // 2. Find the exact start and end of the JSON object
+        const firstBrace = rawText.indexOf("{");
+        const lastBrace = rawText.lastIndexOf("}");
+        
+        if (firstBrace === -1 || lastBrace === -1) {
+            throw new Error("No JSON brackets found in the response.");
+        }
+        
+        // 3. Cut out just the pure JSON string and parse it
+        const cleanJsonString = rawText.substring(firstBrace, lastBrace + 1);
+        parsedData = JSON.parse(cleanJsonString);
+        
+    } catch (parseError) {
+        console.error("CRITICAL: AI failed to output valid JSON. See raw output above.");
+        throw new Error("JSON Parsing failed. The AI output was malformed.");
+    }
         
     // Validate LCP
     if (parsedData.lcpUrl && parsedData.lcpUrl.length < 500 && parsedData.lcpUrl.startsWith("http")) {
