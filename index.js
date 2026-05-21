@@ -68,12 +68,10 @@ async function extractPayload(env) {
             
         // 1. Save the Image to KV
         if (parsedData.lcpUrl) {
-            // Strip the domain so the Edge Worker preloads it natively
-            const cleanEdgeUrl = parsedData.lcpUrl.replace("https://www.eryc.my.id", "");
-            await env.AGP_STATE.put("LCP_IMAGE_URL", cleanEdgeUrl);
+            await env.AGP_STATE.put("LCP_IMAGE_URL", parsedData.lcpUrl);
         } else {
             // Default to your known hero image if AI fails to find one
-            await env.AGP_STATE.put("LCP_IMAGE_URL", "/assets/image/hero.avif");
+            await env.AGP_STATE.put("LCP_IMAGE_URL", "https://www.eryc.my.id/assets/image/hero.avif");
         }
 
         // 2. Build the CSS and save to KV
