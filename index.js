@@ -11,6 +11,29 @@ async function extractPayload(env) {
         console.log("Navigating to site...");
         await page.goto("https://sites.google.com/view/eryc-tri-juni-s-notes/");
         await new Promise(r => setTimeout(r, 3000));
+
+        // ============================================================
+        // ✅ NEW: GSTATIC CSS EXTRACTION
+        // Page is fully loaded here — all <link> tags are in the DOM.
+        // We extract and merge all gstatic stylesheets into one KV blob
+        // so the main worker can inline them synchronously (no async fetch).
+        // ============================================================
+        const gstaticLinks = await page.evaluate(() =>
+            [...document.querySelectorAll('link[rel="stylesheet"]')]
+                .map(l => l.href).filter(h => h.includes('gstatic.com'))
+        );
+        let mergedCss = "";
+        for (const href of gstaticLinks) {
+            const res = await fetch(href);
+            if (res.ok) mergedCss += await res.text();
+        }
+        if (mergedCss) {
+            await env.AGP_STATE.put("GSTATIC_CSS_MERGED", mergedCss, { expirationTtl: 604800 });
+            console.log(`Gstatic CSS cached: ${mergedCss.length} chars from ${gstaticLinks.length} sheet(s).`);
+        } else {
+            console.log("No gstatic stylesheets found on this page.");
+        }
+        // ============================================================
         
         const cleanHTML = await page.evaluate(() => {
             document.querySelectorAll('script, style, svg, path, symbol, iframe, noscript').forEach(e => e.remove());
