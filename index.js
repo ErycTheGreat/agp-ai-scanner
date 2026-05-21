@@ -9,29 +9,50 @@ async function extractPayload(env) {
         const page = await browser.newPage();
         
         console.log("Navigating to site...");
+
+        // ============================================================
+        // ✅ NEW: Start CSS Coverage BEFORE navigation so Puppeteer
+        // captures every byte of every stylesheet from first paint.
+        // Must be called before page.goto() — not after.
+        // ============================================================
+        await page.coverage.startCSSCoverage();
+
         await page.goto("https://sites.google.com/view/eryc-tri-juni-s-notes/");
         await new Promise(r => setTimeout(r, 3000));
 
         // ============================================================
-        // ✅ NEW: GSTATIC CSS EXTRACTION
-        // Page is fully loaded here — all <link> tags are in the DOM.
-        // We extract and merge all gstatic stylesheets into one KV blob
-        // so the main worker can inline them synchronously (no async fetch).
+        // ✅ NEW: CRITICAL CSS EXTRACTION via Coverage API
+        //
+        // Raw approach (old): fetches full 190 KiB gstatic bundle → inlines all of it
+        //   → browser parses 186.8 KiB of unused rules → same bottleneck, different cause
+        //
+        // Coverage approach (new): Puppeteer tracks which CSS byte ranges
+        //   the browser actually *used* to paint this page.
+        //   Result: ~2–5 KiB of real critical CSS instead of 190 KiB.
+        //   Inlining this is near-zero parse cost → FCP drops significantly.
         // ============================================================
-        const gstaticLinks = await page.evaluate(() =>
-            [...document.querySelectorAll('link[rel="stylesheet"]')]
-                .map(l => l.href).filter(h => h.includes('gstatic.com'))
-        );
-        let mergedCss = "";
-        for (const href of gstaticLinks) {
-            const res = await fetch(href);
-            if (res.ok) mergedCss += await res.text();
+        const cssCoverage = await page.coverage.stopCSSCoverage();
+
+        let criticalCss = "";
+        let totalBytes = 0;
+        let usedBytes = 0;
+
+        for (const entry of cssCoverage) {
+            totalBytes += entry.text.length;
+            if (entry.url.includes('gstatic.com')) {
+                // Only extract the byte ranges the browser actually consumed
+                for (const range of entry.ranges) {
+                    criticalCss += entry.text.slice(range.start, range.end) + '\n';
+                    usedBytes += (range.end - range.start);
+                }
+            }
         }
-        if (mergedCss) {
-            await env.AGP_STATE.put("GSTATIC_CSS_MERGED", mergedCss, { expirationTtl: 604800 });
-            console.log(`Gstatic CSS cached: ${mergedCss.length} chars from ${gstaticLinks.length} sheet(s).`);
+
+        if (criticalCss) {
+            await env.AGP_STATE.put("GSTATIC_CSS_MERGED", criticalCss, { expirationTtl: 604800 });
+            console.log(`Critical CSS cached: ${usedBytes} used bytes extracted from ${totalBytes} total bytes (${((usedBytes/totalBytes)*100).toFixed(1)}% of bundle).`);
         } else {
-            console.log("No gstatic stylesheets found on this page.");
+            console.log("No gstatic CSS coverage data found — KV not updated.");
         }
         // ============================================================
         
@@ -66,7 +87,7 @@ async function extractPayload(env) {
         });
 
         let rawText = aiResponse.response || "";
-        console.log("Raw AI Output:", rawText); // We can read this in the logs later!
+        console.log("Raw AI Output:", rawText);
         
         // 🚨 THE GRACEFUL FALLBACK: If AI fails, use safe defaults instead of crashing
         let parsedData = { lcpUrl: "", bgColor: "#020617" }; 
@@ -91,11 +112,9 @@ async function extractPayload(env) {
             
         // 1. Save the Image to KV
         if (parsedData.lcpUrl) {
-            // Strip the domain so the Edge Worker preloads it natively
             const cleanEdgeUrl = parsedData.lcpUrl.replace("https://www.eryc.my.id", "");
             await env.AGP_STATE.put("LCP_IMAGE_URL", cleanEdgeUrl);
         } else {
-            // Default to your known hero image if AI fails to find one
             await env.AGP_STATE.put("LCP_IMAGE_URL", "/assets/image/hero.avif");
         }
 
