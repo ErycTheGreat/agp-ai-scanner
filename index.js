@@ -1,103 +1,134 @@
+/* =============================================================================
+ * AGP SCANNER — writes the "ceiling" state to KV (AGP_STATE)
+ *
+ * What changed vs. the old Llama-based scanner:
+ *   - NO LLM. The old code launched real Chrome (which already KNOWS the LCP and
+ *     which CSS rules are used), threw that away, mangled the DOM to 8000 chars,
+ *     and asked Llama-3-8b to GUESS the LCP url + bg color. That's a hallucination
+ *     risk feeding a top-priority preload header -> non-deterministic LCP poisoning.
+ *   - GROUND TRUTH LCP: read the browser's own largest-contentful-paint entry.
+ *   - REAL CRITICAL CSS: page.coverage records exactly which CSS rules were USED
+ *     during render. That turns the ~195KB gstatic blob into the few KB that
+ *     actually matter -> stored as GHOST_CSS (the "ceiling").
+ *   - Scans the LIVE edge output (www.eryc.my.id), NOT the raw Google Sites URL,
+ *     so the measurements match what PSI / real users actually get. Because the
+ *     edge swaps the LCP element to the small poster, the measured LCP url is the
+ *     poster -> the preload header becomes self-consistent automatically.
+ *   - AUTH on the manual fetch trigger so nobody can spin up Chrome on your dime.
+ *
+ * Required bindings (wrangler.toml):
+ *   browser   = { binding = "MYBROWSER" }       # Browser Rendering
+ *   kv_namespaces: AGP_STATE
+ *   vars/secrets: SCAN_SECRET                    # set via `wrangler secret put`
+ * ============================================================================= */
+
 import puppeteer from "@cloudflare/puppeteer";
 
+const TARGET = "https://www.eryc.my.id/";                       // scan post-edge output
+const FALLBACK_LCP = "https://www.eryc.my.id/assets/image/hero.avif";
+const FALLBACK_CSS = "html{background:#060522}body{background:transparent}";
+const MAX_CSS_BYTES = 60000;                                    // guard KV value size
+
 async function extractPayload(env) {
-    console.log("Starting Asymmetric Ghost Payload Generation...");
-    let browser; 
+  let browser;
+  try {
+    browser = await puppeteer.launch(env.MYBROWSER);
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1366, height: 820 });       // desktop above-fold
 
-    try {
-        browser = await puppeteer.launch(env.MYBROWSER);
-        const page = await browser.newPage();
-        
-        console.log("Navigating to site...");
-        await page.goto("https://sites.google.com/view/eryc-tri-juni-s-notes/");
-        await new Promise(r => setTimeout(r, 3000));
-        
-        const cleanHTML = await page.evaluate(() => {
-            document.querySelectorAll('script, style, svg, path, symbol, iframe, noscript').forEach(e => e.remove());
-            document.querySelectorAll('div[data-code]').forEach(e => e.remove());
-            
-            const elements = document.body.getElementsByTagName('*');
-            for (let i = 0; i < elements.length; i++) {
-                elements[i].removeAttribute('class');
-                elements[i].removeAttribute('id');
-                elements[i].removeAttribute('jsname');
-                elements[i].removeAttribute('jsaction');
-            }
-            return document.body ? document.body.innerHTML.substring(0, 8000) : "";
+    // Start CSS coverage BEFORE navigation. Gracefully degrade if unsupported.
+    let coverageOn = true;
+    try { await page.coverage.startCSSCoverage(); }
+    catch (e) { coverageOn = false; console.warn("CSS coverage unsupported:", e.message); }
+
+    console.log("Navigating to", TARGET);
+    await page.goto(TARGET, { waitUntil: "networkidle0", timeout: 30000 });
+    // Let deferred (media=print -> onload=all) stylesheets actually apply.
+    await new Promise(r => setTimeout(r, 1500));
+
+    // 1) GROUND-TRUTH LCP — ask the engine that computed it.
+    const lcpUrl = await page.evaluate(() => new Promise((resolve) => {
+      try {
+        const obs = new PerformanceObserver((list) => {
+          const entries = list.getEntries();
+          const last = entries[entries.length - 1];
+          if (last) {
+            const url = last.url
+              || (last.element && (last.element.currentSrc || last.element.src))
+              || "";
+            resolve(url);
+          }
         });
+        obs.observe({ type: "largest-contentful-paint", buffered: true });
+        // LCP can keep changing; settle after a short window.
+        setTimeout(() => resolve(""), 2000);
+      } catch (e) { resolve(""); }
+    }));
+    console.log("Measured LCP url:", lcpUrl || "(none)");
 
-        console.log("Clean HTML Length:", cleanHTML.length);
-        if (cleanHTML.length < 100) throw new Error("Browser grabbed a blank page.");
-
-        // 🚨 THE IRONCLAD PROMPT: Forcing the AI to use an exact template
-        const systemPrompt = `You are a strict data parser. Read the HTML and extract the main image URL and background color. 
-        You MUST respond with ONLY this exact JSON format. No other words.
-        {"lcpUrl": "insert_url_here", "bgColor": "insert_color_here"}`;
-
-        console.log("Sending Cleaned DOM to Llama 3...");
-        const aiResponse = await env.AI.run('@cf/meta/llama-3-8b-instruct', {
-            messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: cleanHTML }
-            ]
-        });
-
-        let rawText = aiResponse.response || "";
-        console.log("Raw AI Output:", rawText); // We can read this in the logs later!
-        
-        // 🚨 THE GRACEFUL FALLBACK: If AI fails, use safe defaults instead of crashing
-        let parsedData = { lcpUrl: "", bgColor: "#020617" }; 
-        
-        try {
-            rawText = rawText.replace(/```json/gi, "").replace(/```/g, "").trim();
-            const firstBrace = rawText.indexOf("{");
-            const lastBrace = rawText.lastIndexOf("}");
-            
-            if (firstBrace !== -1 && lastBrace !== -1) {
-                const cleanJsonString = rawText.substring(firstBrace, lastBrace + 1);
-                const aiData = JSON.parse(cleanJsonString);
-                
-                if (aiData.lcpUrl && aiData.lcpUrl.startsWith("http")) parsedData.lcpUrl = aiData.lcpUrl;
-                if (aiData.bgColor) parsedData.bgColor = aiData.bgColor;
-            } else {
-                console.error("AI returned text without JSON. Using fallback defaults.");
-            }
-        } catch (parseError) {
-            console.error("Failed to parse AI JSON. Using fallback defaults.");
+    // 2) REAL CRITICAL CSS — only the rules Chrome actually used.
+    let criticalCss = "";
+    if (coverageOn) {
+      try {
+        const coverage = await page.coverage.stopCSSCoverage();
+        for (const entry of coverage) {
+          for (const range of entry.ranges) {
+            criticalCss += entry.text.slice(range.start, range.end);
+          }
         }
-            
-        // 1. Save the Image to KV
-        if (parsedData.lcpUrl) {
-            await env.AGP_STATE.put("LCP_IMAGE_URL", parsedData.lcpUrl);
-        } else {
-            // Default to your known hero image if AI fails to find one
-            await env.AGP_STATE.put("LCP_IMAGE_URL", "https://www.eryc.my.id/assets/image/hero.avif");
-        }
-
-        // 2. Build the CSS and save to KV
-        const safeCss = `body { background-color: ${parsedData.bgColor} !important; } .ghost-skeleton { width: 100vw; height: 100vh; background-color: ${parsedData.bgColor}; }`;
-        await env.AGP_STATE.put("GHOST_CSS", safeCss);
-        
-        console.log("AGP State Updated Successfully in KV.");
-
-    } finally {
-        if (browser) {
-            console.log("Closing browser session...");
-            await browser.close();
-        }
+      } catch (e) {
+        console.warn("stopCSSCoverage failed:", e.message);
+        criticalCss = "";
+      }
     }
+    criticalCss = criticalCss.replace(/\s+/g, " ").trim();
+    if (criticalCss.length > MAX_CSS_BYTES) {
+      criticalCss = criticalCss.slice(0, MAX_CSS_BYTES);
+      console.warn("Critical CSS truncated to", MAX_CSS_BYTES, "bytes");
+    }
+    console.log("Critical CSS bytes:", criticalCss.length);
+
+    // 3) WRITE KV (the "ceiling"). Floor in the main worker covers any gaps.
+    const finalLcp = (lcpUrl && lcpUrl.startsWith("http")) ? lcpUrl : FALLBACK_LCP;
+    const finalCss = criticalCss.length > 50 ? criticalCss : FALLBACK_CSS;
+
+    await env.AGP_STATE.put("LCP_IMAGE_URL", finalLcp);
+    await env.AGP_STATE.put("GHOST_CSS", finalCss);
+    console.log("AGP_STATE updated.");
+
+    return { lcp: finalLcp, cssBytes: finalCss.length, usedFallbackCss: finalCss === FALLBACK_CSS };
+  } finally {
+    if (browser) {
+      console.log("Closing browser session...");
+      await browser.close();
+    }
+  }
 }
 
 export default {
+  // Cron: refresh the ceiling on a schedule. Don't run too often — the CSS only
+  // changes when the page design changes. Daily/weekly is plenty.
   async scheduled(event, env, ctx) {
-    try { await extractPayload(env); } catch (e) { console.error("Cron AI Failed:", e); }
+    ctx.waitUntil(
+      extractPayload(env).catch((e) => console.error("Cron AGP failed:", e))
+    );
   },
+
+  // Manual trigger — AUTH REQUIRED. Call: https://<scanner>/?key=YOUR_SECRET
   async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const provided = url.searchParams.get("key");
+    if (!env.SCAN_SECRET || provided !== env.SCAN_SECRET) {
+      // Without this, anyone hitting the URL spins up Chrome and burns your quota.
+      return new Response("Forbidden", { status: 403 });
+    }
     try {
-        await extractPayload(env);
-        return new Response("AI Scanner executed! Check your KV Database.", { status: 200 });
+      const result = await extractPayload(env);
+      return new Response("AGP scan OK: " + JSON.stringify(result), {
+        status: 200, headers: { "Content-Type": "text/plain" }
+      });
     } catch (e) {
-        return new Response("AI Scanner Failed. Error: " + e.message, { status: 500 });
+      return new Response("AGP scan failed: " + e.message, { status: 500 });
     }
   }
 };
