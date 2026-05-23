@@ -1,134 +1,98 @@
-/* =============================================================================
- * AGP SCANNER — writes the "ceiling" state to KV (AGP_STATE)
- *
- * What changed vs. the old Llama-based scanner:
- *   - NO LLM. The old code launched real Chrome (which already KNOWS the LCP and
- *     which CSS rules are used), threw that away, mangled the DOM to 8000 chars,
- *     and asked Llama-3-8b to GUESS the LCP url + bg color. That's a hallucination
- *     risk feeding a top-priority preload header -> non-deterministic LCP poisoning.
- *   - GROUND TRUTH LCP: read the browser's own largest-contentful-paint entry.
- *   - REAL CRITICAL CSS: page.coverage records exactly which CSS rules were USED
- *     during render. That turns the ~195KB gstatic blob into the few KB that
- *     actually matter -> stored as GHOST_CSS (the "ceiling").
- *   - Scans the LIVE edge output (www.eryc.my.id), NOT the raw Google Sites URL,
- *     so the measurements match what PSI / real users actually get. Because the
- *     edge swaps the LCP element to the small poster, the measured LCP url is the
- *     poster -> the preload header becomes self-consistent automatically.
- *   - AUTH on the manual fetch trigger so nobody can spin up Chrome on your dime.
- *
- * Required bindings (wrangler.toml):
- *   browser   = { binding = "MYBROWSER" }       # Browser Rendering
- *   kv_namespaces: AGP_STATE
- *   vars/secrets: SCAN_SECRET                    # set via `wrangler secret put`
- * ============================================================================= */
-
 import puppeteer from "@cloudflare/puppeteer";
 
-const TARGET = "https://www.eryc.my.id/";                       // scan post-edge output
-const FALLBACK_LCP = "https://www.eryc.my.id/assets/image/hero.avif";
-const FALLBACK_CSS = "html{background:#060522}body{background:transparent}";
-const MAX_CSS_BYTES = 60000;                                    // guard KV value size
+// We scan the RAW Google Sites page: there gstatic CSS is render-blocking and
+// fully applied, so coverage capture is reliable. The served page uses the SAME
+// structural CSS, so the used-rule set transfers cleanly.
+const TARGET_URL = "https://sites.google.com/view/eryc-tri-juni-s-notes/";
+
+// The main worker deterministically swaps the LCP background to this poster,
+// so the preload target is a CONSTANT WE CONTROL. No model needs to guess it.
+// (If your real LCP element is the hero instead, change this to hero.avif.)
+const KNOWN_LCP_POSTER = "https://www.eryc.my.id/assets/image/homepage-BG-split.avif";
 
 async function extractPayload(env) {
-  let browser;
-  try {
-    browser = await puppeteer.launch(env.MYBROWSER);
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1366, height: 820 });       // desktop above-fold
+    console.log("Starting Asymmetric Ghost Payload Generation...");
+    let browser;
 
-    // Start CSS coverage BEFORE navigation. Gracefully degrade if unsupported.
-    let coverageOn = true;
-    try { await page.coverage.startCSSCoverage(); }
-    catch (e) { coverageOn = false; console.warn("CSS coverage unsupported:", e.message); }
+    try {
+        browser = await puppeteer.launch(env.MYBROWSER);
+        const page = await browser.newPage();
+        await page.setViewport({ width: 1366, height: 900 });
 
-    console.log("Navigating to", TARGET);
-    await page.goto(TARGET, { waitUntil: "networkidle0", timeout: 30000 });
-    // Let deferred (media=print -> onload=all) stylesheets actually apply.
-    await new Promise(r => setTimeout(r, 1500));
-
-    // 1) GROUND-TRUTH LCP — ask the engine that computed it.
-    const lcpUrl = await page.evaluate(() => new Promise((resolve) => {
-      try {
-        const obs = new PerformanceObserver((list) => {
-          const entries = list.getEntries();
-          const last = entries[entries.length - 1];
-          if (last) {
-            const url = last.url
-              || (last.element && (last.element.currentSrc || last.element.src))
-              || "";
-            resolve(url);
-          }
-        });
-        obs.observe({ type: "largest-contentful-paint", buffered: true });
-        // LCP can keep changing; settle after a short window.
-        setTimeout(() => resolve(""), 2000);
-      } catch (e) { resolve(""); }
-    }));
-    console.log("Measured LCP url:", lcpUrl || "(none)");
-
-    // 2) REAL CRITICAL CSS — only the rules Chrome actually used.
-    let criticalCss = "";
-    if (coverageOn) {
-      try {
-        const coverage = await page.coverage.stopCSSCoverage();
-        for (const entry of coverage) {
-          for (const range of entry.ranges) {
-            criticalCss += entry.text.slice(range.start, range.end);
-          }
+        // 1. Ask the ENGINE which CSS rules it actually uses (ground truth),
+        //    instead of asking an LLM to guess from mangled HTML.
+        let coverageSupported = true;
+        try {
+            await page.coverage.startCSSCoverage();
+        } catch (e) {
+            coverageSupported = false;
+            console.error("CSS coverage unavailable in this runtime:", e.message);
         }
-      } catch (e) {
-        console.warn("stopCSSCoverage failed:", e.message);
-        criticalCss = "";
-      }
-    }
-    criticalCss = criticalCss.replace(/\s+/g, " ").trim();
-    if (criticalCss.length > MAX_CSS_BYTES) {
-      criticalCss = criticalCss.slice(0, MAX_CSS_BYTES);
-      console.warn("Critical CSS truncated to", MAX_CSS_BYTES, "bytes");
-    }
-    console.log("Critical CSS bytes:", criticalCss.length);
 
-    // 3) WRITE KV (the "ceiling"). Floor in the main worker covers any gaps.
-    const finalLcp = (lcpUrl && lcpUrl.startsWith("http")) ? lcpUrl : FALLBACK_LCP;
-    const finalCss = criticalCss.length > 50 ? criticalCss : FALLBACK_CSS;
+        console.log("Navigating to site...");
+        await page.goto(TARGET_URL, { waitUntil: "networkidle0", timeout: 30000 });
+        await new Promise(r => setTimeout(r, 1500)); // settle render
 
-    await env.AGP_STATE.put("LCP_IMAGE_URL", finalLcp);
-    await env.AGP_STATE.put("GHOST_CSS", finalCss);
-    console.log("AGP_STATE updated.");
+        // 2. Build the critical CSS from the rules Chrome actually applied.
+        let criticalCss = "";
+        if (coverageSupported) {
+            try {
+                const coverage = await page.coverage.stopCSSCoverage();
+                for (const entry of coverage) {
+                    for (const range of entry.ranges) {
+                        criticalCss += entry.text.slice(range.start, range.end);
+                    }
+                }
+                criticalCss = criticalCss.trim();
+            } catch (e) {
+                console.error("Failed reading CSS coverage:", e.message);
+            }
+        }
 
-    return { lcp: finalLcp, cssBytes: finalCss.length, usedFallbackCss: finalCss === FALLBACK_CSS };
-  } finally {
-    if (browser) {
-      console.log("Closing browser session...");
-      await browser.close();
+        console.log("Critical CSS length:", criticalCss.length);
+
+        // 3. THE GRACEFUL FALLBACK: only overwrite GHOST_CSS if we captured
+        //    something real, so a bad run never wipes a known-good ceiling.
+        if (criticalCss.length > 50) {
+            await env.AGP_STATE.put("GHOST_CSS", criticalCss);
+            console.log("GHOST_CSS updated in KV.");
+        } else {
+            console.error("Critical CSS too small; keeping previous GHOST_CSS.");
+        }
+
+        // 4. LCP preload target is the poster the worker injects — deterministic.
+        await env.AGP_STATE.put("LCP_IMAGE_URL", KNOWN_LCP_POSTER);
+
+        console.log("AGP State Updated Successfully in KV.");
+
+    } finally {
+        if (browser) {
+            console.log("Closing browser session...");
+            await browser.close();
+        }
     }
-  }
 }
 
 export default {
-  // Cron: refresh the ceiling on a schedule. Don't run too often — the CSS only
-  // changes when the page design changes. Daily/weekly is plenty.
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(
-      extractPayload(env).catch((e) => console.error("Cron AGP failed:", e))
-    );
+    try { await extractPayload(env); } catch (e) { console.error("Cron AI Failed:", e); }
   },
-
-  // Manual trigger — AUTH REQUIRED. Call: https://<scanner>/?key=YOUR_SECRET
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const provided = url.searchParams.get("key");
-    if (!env.SCAN_SECRET || provided !== env.SCAN_SECRET) {
-      // Without this, anyone hitting the URL spins up Chrome and burns your quota.
-      return new Response("Forbidden", { status: 403 });
+    // Guard the manual trigger so a random crawler can't spin up Chrome on every
+    // hit and burn your Browser Rendering quota. Set SCAN_SECRET in the dashboard,
+    // then trigger via /?key=YOUR_SECRET. If SCAN_SECRET is unset, behaviour is
+    // unchanged (open trigger).
+    if (env.SCAN_SECRET) {
+        const key = new URL(request.url).searchParams.get("key");
+        if (key !== env.SCAN_SECRET) {
+            return new Response("Forbidden", { status: 403 });
+        }
     }
     try {
-      const result = await extractPayload(env);
-      return new Response("AGP scan OK: " + JSON.stringify(result), {
-        status: 200, headers: { "Content-Type": "text/plain" }
-      });
+        await extractPayload(env);
+        return new Response("AI Scanner executed! Check your KV Database.", { status: 200 });
     } catch (e) {
-      return new Response("AGP scan failed: " + e.message, { status: 500 });
+        return new Response("AI Scanner Failed. Error: " + e.message, { status: 500 });
     }
   }
 };
