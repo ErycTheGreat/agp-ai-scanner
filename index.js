@@ -34,8 +34,10 @@ async function extractPayload(env) {
         You MUST respond with ONLY this exact JSON format. No other words.
         {"lcpUrl": "insert_url_here", "bgColor": "insert_color_here"}`;
 
-        console.log("Sending Cleaned DOM to Llama 3...");
-        const aiResponse = await env.AI.run('@cf/meta/llama-3-8b-instruct', {
+        console.log("Sending Cleaned DOM to AI...");
+        
+        // 👇 UPDATED LINE: Swapped deprecated Llama 3 for Llama 3.1
+        const aiResponse = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
             messages: [
             { role: "system", content: systemPrompt },
             { role: "user", content: cleanHTML }
@@ -43,7 +45,7 @@ async function extractPayload(env) {
         });
 
         let rawText = aiResponse.response || "";
-        console.log("Raw AI Output:", rawText); // We can read this in the logs later!
+        console.log("Raw AI Output:", rawText); 
         
         // 🚨 THE GRACEFUL FALLBACK: If AI fails, use safe defaults instead of crashing
         let parsedData = { lcpUrl: "", bgColor: "#020617" }; 
