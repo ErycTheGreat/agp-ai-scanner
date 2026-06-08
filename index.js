@@ -12,22 +12,43 @@ async function extractPayload(env) {
         await page.goto("https://www.eryc.my.id/");
         await new Promise(r => setTimeout(r, 3000));
 
-        // ✅ EDIT 1: Fetch and cache gstatic CSS into KV BEFORE stripping the DOM.
-        // This eliminates the live subrequest inside the HTMLRewriter transform pipeline
-        // that was locking FCP/LCP/SI to 4.1s on every single page request.
-        // Scanner runs once per cron cycle; worker reads from KV at sub-1ms.
+        // ✅ EDIT: Fetch gstatic CSS and save to BOTH R2 and KV.
+        //
+        // WHY R2 (not KV inline):
+        // Inlining 198 KiB into the HTML document inflates the payload to ~250 KB.
+        // On slow 4G (1.6 Mbps), the browser can't render a single pixel until it
+        // downloads ALL 250 KB — locking FCP/LCP/SI to ~4.1s regardless of whether
+        // the CSS came from KV or a live fetch. Moving to an external file lets the
+        // browser download HTML (~50 KB) and CSS (~198 KB) in parallel.
+        //
+        // WHY also KV (sentinel flag):
+        // The worker can't check R2 existence without a blocking await.
+        // KV "GSTATIC_CSS" being non-empty means the R2 file is populated and safe
+        // to reference. On first deploy before scanner runs, KV is empty → worker
+        // falls back to defer (no crash, slightly slower until scanner populates it).
         try {
             const gstaticHref = await page.evaluate(() => {
                 const link = document.querySelector('link[rel="stylesheet"][href*="gstatic.com"]');
                 return link ? link.href : null;
             });
+
             if (gstaticHref) {
                 console.log("Found gstatic CSS href:", gstaticHref);
                 const cssRes = await fetch(gstaticHref);
+
                 if (cssRes.ok) {
                     const cssText = await cssRes.text();
-                    await env.AGP_STATE.put("GSTATIC_CSS", cssText);
-                    console.log("GSTATIC_CSS saved to KV. Length:", cssText.length);
+
+                    // 1. Save to R2 — served as external CSS file via asset proxy
+                    await env.MY_ASSETS.put("css/gstatic-cache.css", cssText, {
+                        httpMetadata: { contentType: "text/css" }
+                    });
+                    console.log("GSTATIC CSS saved to R2 at css/gstatic-cache.css. Length:", cssText.length);
+
+                    // 2. Save sentinel to KV — worker reads this to know R2 file exists
+                    // Store a short flag, not the full CSS (no need to inline anymore)
+                    await env.AGP_STATE.put("GSTATIC_CSS", "ready");
+                    console.log("GSTATIC_CSS sentinel saved to KV.");
                 }
             } else {
                 console.log("No gstatic CSS link found on page.");
@@ -95,18 +116,12 @@ async function extractPayload(env) {
             console.error("Failed to parse AI JSON. Using fallback defaults.");
         }
             
-        // ✅ EDIT 2: Always hardcode hero.avif as LCP_IMAGE_URL.
-        // The Puppeteer browser fires Engine 2 (it's a real browser), so by the time
-        // AI reads the DOM the heavy AVIF has already been swapped in. If AI writes
-        // that heavy URL to KV, the worker preloads it via HTTP header for everyone
-        // including PSI — bypassing every JS guard before the page loads.
+        // Always hardcode hero.avif — prevents scanner from writing heavy AVIF
+        // URL to KV after Engine 2 fires the swap during Puppeteer visit
         await env.AGP_STATE.put("LCP_IMAGE_URL", "/assets/image/hero.avif");
         console.log("LCP_IMAGE_URL saved: /assets/image/hero.avif (hardcoded)");
 
-        // ✅ EDIT 3: GHOST_CSS targets `html`, not `body`.
-        // The worker's edge-anti-flash sets body { background: transparent } so the
-        // html canvas color shows through. Overriding body here breaks that trick
-        // and causes a white flash + CLS on mobile cold loads.
+        // GHOST_CSS: target `html` not `body` to avoid overriding edge-anti-flash
         const safeCss = `html { background-color: #060522 !important; } .ghost-skeleton { width: 100vw; height: 100vh; background-color: #060522; }`;
         await env.AGP_STATE.put("GHOST_CSS", safeCss);
         console.log("GHOST_CSS saved (hardcoded #060522, targets html only)");
