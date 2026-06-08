@@ -2,78 +2,110 @@ import puppeteer from "@cloudflare/puppeteer";
 
 async function extractPayload(env) {
     console.log("Starting Asymmetric Ghost Payload Generation...");
-    let browser; 
+    let browser;
 
     try {
         browser = await puppeteer.launch(env.MYBROWSER);
         const page = await browser.newPage();
-        
-        console.log("Navigating to site...");
-        // Navigation happens inside the coverage block below
 
-        // ✅ EDIT: Fetch gstatic CSS and save to BOTH R2 and KV.
+        // =================================================================
+        // STEP 1: Get original gstatic URL via bot debug path
         //
-        // WHY R2 (not KV inline):
-        // Inlining 198 KiB into the HTML document inflates the payload to ~250 KB.
-        // On slow 4G (1.6 Mbps), the browser can't render a single pixel until it
-        // downloads ALL 250 KB — locking FCP/LCP/SI to ~4.1s regardless of whether
-        // the CSS came from KV or a live fetch. Moving to an external file lets the
-        // browser download HTML (~50 KB) and CSS (~198 KB) in parallel.
-        //
-        // WHY also KV (sentinel flag):
-        // The worker can't check R2 existence without a blocking await.
-        // KV "GSTATIC_CSS" being non-empty means the R2 file is populated and safe
-        // to reference. On first deploy before scanner runs, KV is empty → worker
-        // falls back to defer (no crash, slightly slower until scanner populates it).
-        try {
-            // ✅ FIX 1: Use Chrome Coverage API to extract ONLY the CSS rules
-            // that are actually used during first paint — instead of saving the
-            // full 182 KiB file where 179 KiB is unused.
-            // Target: ~5-15 KiB critical CSS vs 182 KiB full CSS.
-            // This eliminates the render-blocking 2,700ms download on slow 4G.
-            await page.coverage.startCSSCoverage();
+        // WHY ?debug=bot:
+        // The main worker's human fast-lane transforms link[rel="stylesheet"]
+        // pointing to gstatic.com → our R2 URL. The bot path has no stylesheet
+        // handler, so it exposes the original gstatic.com URL intact.
+        // This lets us fetch the full CSS directly without going through our
+        // own worker's R2 proxy.
+        // =================================================================
+        console.log("Step 1: Getting original gstatic URL via bot path...");
+        await page.goto("https://www.eryc.my.id/?debug=bot");
 
-            // Re-navigate so coverage captures the actual first-paint CSS usage
-            await page.goto("https://www.eryc.my.id/");
-            await new Promise(r => setTimeout(r, 3000));
+        const gstaticHref = await page.evaluate(() => {
+            const link = document.querySelector('link[rel="stylesheet"][href*="gstatic.com"]');
+            return link ? link.href : null;
+        });
 
-            const cssCoverage = await page.coverage.stopCSSCoverage();
+        console.log("gstatic href found:", gstaticHref);
 
-            // Extract only the used ranges from gstatic stylesheet
-            const gstaticEntries = cssCoverage.filter(entry =>
-                entry.url.includes('gstatic.com')
-            );
+        if (gstaticHref) {
+            // =============================================================
+            // STEP 2: Fetch full CSS directly from gstatic and save to R2
+            //
+            // This guarantees R2 always has valid CSS as a baseline.
+            // Even if critical CSS extraction fails later, the page works.
+            // =============================================================
+            console.log("Step 2: Fetching full CSS from gstatic...");
+            const fullCssRes = await fetch(gstaticHref);
 
-            let criticalCss = "";
-            for (const entry of gstaticEntries) {
-                for (const range of entry.ranges) {
-                    criticalCss += entry.text.slice(range.start, range.end) + "\n";
-                }
-            }
+            if (fullCssRes.ok) {
+                const fullCssText = await fullCssRes.text();
+                console.log("Full CSS fetched:", fullCssText.length, "bytes");
 
-            if (criticalCss.length > 100) {
-                console.log(`Critical CSS extracted: ${criticalCss.length} bytes (from full gstatic CSS)`);
-
-                // Save to R2
-                await env.MY_ASSETS.put("css/gstatic-cache.css", criticalCss, {
+                // Save full CSS to R2 as baseline
+                await env.MY_ASSETS.put("css/gstatic-cache.css", fullCssText, {
                     httpMetadata: { contentType: "text/css" }
                 });
-                console.log("Critical CSS saved to R2 at css/gstatic-cache.css");
-
-                // Sentinel flag in KV
                 await env.AGP_STATE.put("GSTATIC_CSS", "ready");
-                console.log("GSTATIC_CSS sentinel saved to KV.");
+                console.log("Full CSS saved to R2 as baseline.");
+
+                // ==========================================================
+                // STEP 3: Coverage pass on the normal page
+                //
+                // R2 now has valid CSS, so the worker serves it from
+                // /assets/css/gstatic-cache.css. Coverage captures which
+                // rules from THAT URL are actually used during first paint.
+                // Filter matches our R2 URL (not gstatic.com) because the
+                // worker already transformed it.
+                // ==========================================================
+                console.log("Step 3: Running CSS coverage pass...");
+                await page.coverage.startCSSCoverage();
+                await page.goto("https://www.eryc.my.id/");
+                await new Promise(r => setTimeout(r, 3000));
+                const cssCoverage = await page.coverage.stopCSSCoverage();
+
+                // Match our R2 URL OR original gstatic URL (handles both states)
+                const cssEntry = cssCoverage.find(entry =>
+                    entry.url.includes('gstatic-cache.css') ||
+                    entry.url.includes('gstatic.com')
+                );
+
+                if (cssEntry && cssEntry.ranges.length > 0) {
+                    const criticalCss = cssEntry.ranges
+                        .map(range => cssEntry.text.slice(range.start, range.end))
+                        .join('\n');
+
+                    console.log(`Critical CSS extracted: ${criticalCss.length} bytes (from ${fullCssText.length} bytes)`);
+
+                    if (criticalCss.length > 500) {
+                        // Replace full CSS with critical-only version
+                        await env.MY_ASSETS.put("css/gstatic-cache.css", criticalCss, {
+                            httpMetadata: { contentType: "text/css" }
+                        });
+                        console.log("Critical CSS saved to R2 — replaced full CSS.");
+                    } else {
+                        console.log("Critical CSS suspiciously small, keeping full CSS as safety net.");
+                    }
+                } else {
+                    console.log("No CSS coverage entries found — keeping full CSS in R2.");
+                }
             } else {
-                console.log("No gstatic CSS coverage found — skipping R2 save.");
+                console.log("Failed to fetch gstatic CSS, status:", fullCssRes.status);
             }
-        } catch (gstaticErr) {
-            console.error("Failed to extract critical CSS:", gstaticErr);
+        } else {
+            console.log("No gstatic link found on bot path — Google Sites may have changed.");
         }
-        
+
+        // =================================================================
+        // STEP 4: Navigate normal page for AGP DOM payload
+        // =================================================================
+        console.log("Step 4: Navigating for AGP DOM payload...");
+        await page.goto("https://www.eryc.my.id/");
+        await new Promise(r => setTimeout(r, 3000));
+
         const cleanHTML = await page.evaluate(() => {
             document.querySelectorAll('script, style, svg, path, symbol, iframe, noscript').forEach(e => e.remove());
             document.querySelectorAll('div[data-code]').forEach(e => e.remove());
-            
             const elements = document.body.getElementsByTagName('*');
             for (let i = 0; i < elements.length; i++) {
                 elements[i].removeAttribute('class');
@@ -91,55 +123,46 @@ async function extractPayload(env) {
         You MUST respond with ONLY this exact JSON format. No other words.
         {"lcpUrl": "insert_url_here", "bgColor": "insert_color_here"}`;
 
-        console.log("Sending Cleaned DOM to AI...");
-        
         const aiResponse = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
             messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: cleanHTML }
+                { role: "system", content: systemPrompt },
+                { role: "user", content: cleanHTML }
             ]
         });
 
         let rawText = aiResponse.response || "";
-        console.log("Raw AI Output:", rawText); 
-        
-        let parsedData = { lcpUrl: "", bgColor: "#020617" }; 
-        
+        console.log("Raw AI Output:", rawText);
+
+        let parsedData = { lcpUrl: "", bgColor: "#020617" };
+
         try {
             rawText = rawText.replace(/```json/gi, "").replace(/```/g, "").trim();
             const firstBrace = rawText.indexOf("{");
             const lastBrace = rawText.lastIndexOf("}");
-            
             if (firstBrace !== -1 && lastBrace !== -1) {
-                const cleanJsonString = rawText.substring(firstBrace, lastBrace + 1);
-                const aiData = JSON.parse(cleanJsonString);
-                
-                if (aiData.lcpUrl && 
-                    aiData.lcpUrl.startsWith("http") && 
+                const aiData = JSON.parse(rawText.substring(firstBrace, lastBrace + 1));
+                if (aiData.lcpUrl &&
+                    aiData.lcpUrl.startsWith("http") &&
                     aiData.lcpUrl.includes("www.eryc.my.id") &&
-                    !aiData.lcpUrl.includes("lh3.googleusercontent.com") &&
                     !aiData.lcpUrl.includes("googleusercontent.com")) {
                     parsedData.lcpUrl = aiData.lcpUrl;
                 }
                 if (aiData.bgColor) parsedData.bgColor = aiData.bgColor;
-            } else {
-                console.error("AI returned text without JSON. Using fallback defaults.");
             }
         } catch (parseError) {
             console.error("Failed to parse AI JSON. Using fallback defaults.");
         }
-            
-        // Always hardcode hero.avif — prevents scanner from writing heavy AVIF
-        // URL to KV after Engine 2 fires the swap during Puppeteer visit
-        await env.AGP_STATE.put("LCP_IMAGE_URL", "/assets/image/hero.avif");
-        console.log("LCP_IMAGE_URL saved: /assets/image/hero.avif (hardcoded)");
 
-        // GHOST_CSS: target `html` not `body` to avoid overriding edge-anti-flash
+        // Always hardcode hero.avif — prevents scanner writing heavy AVIF URL to KV
+        await env.AGP_STATE.put("LCP_IMAGE_URL", "/assets/image/hero.avif");
+        console.log("LCP_IMAGE_URL saved: /assets/image/hero.avif");
+
+        // GHOST_CSS targets html not body — avoids overriding edge-anti-flash transparent body
         const safeCss = `html { background-color: #060522 !important; } .ghost-skeleton { width: 100vw; height: 100vh; background-color: #060522; }`;
         await env.AGP_STATE.put("GHOST_CSS", safeCss);
-        console.log("GHOST_CSS saved (hardcoded #060522, targets html only)");
-        
-        console.log("AGP State Updated Successfully in KV.");
+        console.log("GHOST_CSS saved.");
+
+        console.log("AGP State Updated Successfully.");
 
     } finally {
         if (browser) {
@@ -150,15 +173,15 @@ async function extractPayload(env) {
 }
 
 export default {
-  async scheduled(event, env, ctx) {
-    try { await extractPayload(env); } catch (e) { console.error("Cron AI Failed:", e); }
-  },
-  async fetch(request, env, ctx) {
-    try {
-        await extractPayload(env);
-        return new Response("AI Scanner executed! Check your KV Database.", { status: 200 });
-    } catch (e) {
-        return new Response("AI Scanner Failed. Error: " + e.message, { status: 500 });
+    async scheduled(event, env, ctx) {
+        try { await extractPayload(env); } catch (e) { console.error("Cron AI Failed:", e); }
+    },
+    async fetch(request, env, ctx) {
+        try {
+            await extractPayload(env);
+            return new Response("AI Scanner executed! Check your KV and R2.", { status: 200 });
+        } catch (e) {
+            return new Response("AI Scanner Failed. Error: " + e.message, { status: 500 });
+        }
     }
-  }
 };
