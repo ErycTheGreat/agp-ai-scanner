@@ -9,8 +9,7 @@ async function extractPayload(env) {
         const page = await browser.newPage();
         
         console.log("Navigating to site...");
-        await page.goto("https://www.eryc.my.id/");
-        await new Promise(r => setTimeout(r, 3000));
+        // Navigation happens inside the coverage block below
 
         // ✅ EDIT: Fetch gstatic CSS and save to BOTH R2 and KV.
         //
@@ -27,34 +26,48 @@ async function extractPayload(env) {
         // to reference. On first deploy before scanner runs, KV is empty → worker
         // falls back to defer (no crash, slightly slower until scanner populates it).
         try {
-            const gstaticHref = await page.evaluate(() => {
-                const link = document.querySelector('link[rel="stylesheet"][href*="gstatic.com"]');
-                return link ? link.href : null;
-            });
+            // ✅ FIX 1: Use Chrome Coverage API to extract ONLY the CSS rules
+            // that are actually used during first paint — instead of saving the
+            // full 182 KiB file where 179 KiB is unused.
+            // Target: ~5-15 KiB critical CSS vs 182 KiB full CSS.
+            // This eliminates the render-blocking 2,700ms download on slow 4G.
+            await page.coverage.startCSSCoverage();
 
-            if (gstaticHref) {
-                console.log("Found gstatic CSS href:", gstaticHref);
-                const cssRes = await fetch(gstaticHref);
+            // Re-navigate so coverage captures the actual first-paint CSS usage
+            await page.goto("https://www.eryc.my.id/");
+            await new Promise(r => setTimeout(r, 3000));
 
-                if (cssRes.ok) {
-                    const cssText = await cssRes.text();
+            const cssCoverage = await page.coverage.stopCSSCoverage();
 
-                    // 1. Save to R2 — served as external CSS file via asset proxy
-                    await env.MY_ASSETS.put("css/gstatic-cache.css", cssText, {
-                        httpMetadata: { contentType: "text/css" }
-                    });
-                    console.log("GSTATIC CSS saved to R2 at css/gstatic-cache.css. Length:", cssText.length);
+            // Extract only the used ranges from gstatic stylesheet
+            const gstaticEntries = cssCoverage.filter(entry =>
+                entry.url.includes('gstatic.com')
+            );
 
-                    // 2. Save sentinel to KV — worker reads this to know R2 file exists
-                    // Store a short flag, not the full CSS (no need to inline anymore)
-                    await env.AGP_STATE.put("GSTATIC_CSS", "ready");
-                    console.log("GSTATIC_CSS sentinel saved to KV.");
+            let criticalCss = "";
+            for (const entry of gstaticEntries) {
+                for (const range of entry.ranges) {
+                    criticalCss += entry.text.slice(range.start, range.end) + "\n";
                 }
+            }
+
+            if (criticalCss.length > 100) {
+                console.log(`Critical CSS extracted: ${criticalCss.length} bytes (from full gstatic CSS)`);
+
+                // Save to R2
+                await env.MY_ASSETS.put("css/gstatic-cache.css", criticalCss, {
+                    httpMetadata: { contentType: "text/css" }
+                });
+                console.log("Critical CSS saved to R2 at css/gstatic-cache.css");
+
+                // Sentinel flag in KV
+                await env.AGP_STATE.put("GSTATIC_CSS", "ready");
+                console.log("GSTATIC_CSS sentinel saved to KV.");
             } else {
-                console.log("No gstatic CSS link found on page.");
+                console.log("No gstatic CSS coverage found — skipping R2 save.");
             }
         } catch (gstaticErr) {
-            console.error("Failed to cache gstatic CSS:", gstaticErr);
+            console.error("Failed to extract critical CSS:", gstaticErr);
         }
         
         const cleanHTML = await page.evaluate(() => {
