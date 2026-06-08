@@ -81,8 +81,8 @@ async function extractPayload(env) {
 		await env.AGP_STATE.put("LCP_IMAGE_URL", "/assets/image/hero.avif");
 
         // 2. Build the CSS and save to KV
-        const safeCss = `html { background-color: ${parsedData.bgColor} !important; } .ghost-skeleton { width: 100vw; height: 100vh; background-color: ${parsedData.bgColor}; }`;
-        await env.AGP_STATE.put("GHOST_CSS", safeCss);
+        const safeCss = `html { background-color: #060522 !important; } .ghost-skeleton { width: 100vw; height: 100vh; background-color: #060522; }`;
+		await env.AGP_STATE.put("GHOST_CSS", safeCss);
         
         console.log("AGP State Updated Successfully in KV.");
 
