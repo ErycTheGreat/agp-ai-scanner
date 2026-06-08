@@ -75,14 +75,10 @@ async function extractPayload(env) {
         }
             
         // 1. Save the Image to KV
-        if (parsedData.lcpUrl) {
-            // Strip the domain so the Edge Worker preloads it natively
-            const cleanEdgeUrl = parsedData.lcpUrl.replace("https://www.eryc.my.id", "");
-            await env.AGP_STATE.put("LCP_IMAGE_URL", cleanEdgeUrl);
-        } else {
-            // Default to your known hero image if AI fails to find one
-            await env.AGP_STATE.put("LCP_IMAGE_URL", "/assets/image/hero.avif");
-        }
+        // Always hardcode hero.avif — the scanner fires after Engine 2 swaps the bg,
+		// so AI would otherwise write the heavy AVIF into KV, which gets injected as
+		// an HTTP preload header for everyone including PSI before any JS can run.
+		await env.AGP_STATE.put("LCP_IMAGE_URL", "/assets/image/hero.avif");
 
         // 2. Build the CSS and save to KV
         const safeCss = `body { background-color: ${parsedData.bgColor} !important; } .ghost-skeleton { width: 100vw; height: 100vh; background-color: ${parsedData.bgColor}; }`;
