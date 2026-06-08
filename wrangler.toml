@@ -12,6 +12,11 @@ crons = ["0 */12 * * *"]
 binding = "AGP_STATE"
 id = "9a9985fe64c34f6ea7eb41de408ccbcd"
 
+# R2 bucket for storing cached assets (gstatic CSS, llms.txt, etc.)
+[[r2_buckets]]
+binding = "MY_ASSETS"
+bucket_name = "eryc-assets"
+
 # Activate the AI and Browser
 [ai]
 binding = "AI"
