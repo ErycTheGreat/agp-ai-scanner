@@ -61,6 +61,7 @@ async function extractPayload(env) {
                 
                 if (aiData.lcpUrl && 
 					aiData.lcpUrl.startsWith("http") && 
+					aiData.lcpUrl.includes("www.eryc.my.id") &&
 					!aiData.lcpUrl.includes("lh3.googleusercontent.com") &&
 					!aiData.lcpUrl.includes("googleusercontent.com")) {
 					parsedData.lcpUrl = aiData.lcpUrl;
