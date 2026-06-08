@@ -28,10 +28,6 @@ async function extractPayload(env) {
         // Now proceed to gut the DOM for the Llama AI parser...
         const cleanHTML = await page.evaluate(() => {
             document.querySelectorAll('script, style, svg, path, symbol, iframe, noscript').forEach(e => e.remove());
-		
-		
-        const cleanHTML = await page.evaluate(() => {
-            document.querySelectorAll('script, style, svg, path, symbol, iframe, noscript').forEach(e => e.remove());
             document.querySelectorAll('div[data-code]').forEach(e => e.remove());
             
             const elements = document.body.getElementsByTagName('*');
