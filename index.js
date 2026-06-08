@@ -11,21 +11,7 @@ async function extractPayload(env) {
         console.log("Navigating to site...");
         await page.goto("https://www.eryc.my.id/");
         await new Promise(r => setTimeout(r, 3000));
-
-		
-		// 🚀 NEW: GRAB THE FULLY RENDERED HTML BEFORE CLEANING
-        console.log("Capturing full HTML payload for Edge Cache...");
-        const fullPageHTML = await page.content();
         
-        if (env.SEO_PAYLOADS) {
-            // Save it to your SEO KV using the root path
-            await env.SEO_PAYLOADS.put("/", fullPageHTML);
-            console.log("Full HTML saved to SEO_PAYLOADS KV successfully!");
-        } else {
-            console.error("WARNING: SEO_PAYLOADS KV binding is missing in this Worker.");
-        }
-
-        // Now proceed to gut the DOM for the Llama AI parser...
         const cleanHTML = await page.evaluate(() => {
             document.querySelectorAll('script, style, svg, path, symbol, iframe, noscript').forEach(e => e.remove());
             document.querySelectorAll('div[data-code]').forEach(e => e.remove());
