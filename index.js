@@ -9,7 +9,7 @@ async function extractPayload(env) {
         const page = await browser.newPage();
         
         console.log("Navigating to site...");
-        await page.goto("https://sites.google.com/view/eryc-tri-juni-s-notes/");
+        await page.goto("https://www.eryc.my.id/");
         await new Promise(r => setTimeout(r, 3000));
         
         const cleanHTML = await page.evaluate(() => {
@@ -59,7 +59,13 @@ async function extractPayload(env) {
                 const cleanJsonString = rawText.substring(firstBrace, lastBrace + 1);
                 const aiData = JSON.parse(cleanJsonString);
                 
-                if (aiData.lcpUrl && aiData.lcpUrl.startsWith("http")) parsedData.lcpUrl = aiData.lcpUrl;
+                if (aiData.lcpUrl && 
+					aiData.lcpUrl.startsWith("http") && 
+					aiData.lcpUrl.includes("www.eryc.my.id") &&
+					!aiData.lcpUrl.includes("lh3.googleusercontent.com") &&
+					!aiData.lcpUrl.includes("googleusercontent.com")) {
+					parsedData.lcpUrl = aiData.lcpUrl;
+				}
                 if (aiData.bgColor) parsedData.bgColor = aiData.bgColor;
             } else {
                 console.error("AI returned text without JSON. Using fallback defaults.");
