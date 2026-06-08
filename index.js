@@ -52,16 +52,21 @@ async function extractPayload(env) {
         console.log("Root BG Color:", rootBgColor);
         if (cleanHTML.length < 100) throw new Error("Browser grabbed a blank page.");
 
-        // 🔒 FIX #1 (model): Upgraded to Llama 3.3 70B for more reliable JSON output.
-        // 8B models frequently return relative paths or description text.
-        const systemPrompt = `You are a strict JSON data extractor. Read the HTML and find the most prominent above-the-fold image src URL.
+        // 🔒 WHY NO AI URL DETECTION:
+        // The Puppeteer browser is a real browser — it passes all Engine 2 guards,
+        // so triggerBg() fires and swaps data-heavy-bg into background-image.
+        // The AI then sees the heavy AVIF (homepage-BG.avif) as the prominent image
+        // and writes it to LCP_IMAGE_URL KV. The main worker then preloads that
+        // heavy URL via HTTP header for ALL visitors including PSI — bypassing every
+        // client-side guard. So we never ask AI to detect the LCP URL.
+        const systemPrompt = `You are a strict JSON data extractor. Read the HTML and find the computed background-color of the page root.
 Rules:
 - Respond with ONLY this exact JSON object. No preamble, no markdown, no explanation.
-- The URL must be an absolute URL starting with https://www.eryc.my.id
-- If no qualifying URL is found, use the string "NOT_FOUND" for lcpUrl
-{"lcpUrl": "https://www.eryc.my.id/assets/image/EXAMPLE.avif"}`;
+- bgColor must be a valid CSS hex color like "#060522"
+- If unsure, use "#060522"
+{"bgColor": "#060522"}`;
 
-        console.log("Sending Cleaned DOM to AI...");
+        console.log("Sending Cleaned DOM to AI for bgColor only...");
 
         const aiResponse = await env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
             messages: [
@@ -73,10 +78,9 @@ Rules:
         let rawText = aiResponse.response || "";
         console.log("Raw AI Output:", rawText);
 
-        // Graceful fallback defaults
+        // Graceful fallback
         let parsedData = {
-            lcpUrl: "",
-            bgColor: rootBgColor // 🔒 FIX #1 (css): Use the real computed color, not AI guess
+            bgColor: rootBgColor
         };
 
         try {
@@ -87,32 +91,20 @@ Rules:
             if (firstBrace !== -1 && lastBrace !== -1) {
                 const cleanJsonString = rawText.substring(firstBrace, lastBrace + 1);
                 const aiData = JSON.parse(cleanJsonString);
-
-                if (
-                    aiData.lcpUrl &&
-                    aiData.lcpUrl !== "NOT_FOUND" &&
-                    aiData.lcpUrl.startsWith("https://www.eryc.my.id") &&
-                    !aiData.lcpUrl.includes("googleusercontent.com")
-                ) {
-                    parsedData.lcpUrl = aiData.lcpUrl;
+                if (aiData.bgColor && /^#[0-9a-fA-F]{3,6}$/.test(aiData.bgColor)) {
+                    parsedData.bgColor = aiData.bgColor;
                 }
             } else {
-                console.error("AI returned text without JSON. Using fallback defaults.");
+                console.error("AI returned text without JSON. Using computed color fallback.");
             }
         } catch (parseError) {
-            console.error("Failed to parse AI JSON. Using fallback defaults.");
+            console.error("Failed to parse AI JSON. Using computed color fallback.");
         }
 
-        // 1. Save the LCP Image URL to KV
-        if (parsedData.lcpUrl) {
-            const cleanEdgeUrl = parsedData.lcpUrl.replace("https://www.eryc.my.id", "");
-            await env.AGP_STATE.put("LCP_IMAGE_URL", cleanEdgeUrl);
-            console.log("LCP URL saved:", cleanEdgeUrl);
-        } else {
-            // Fallback: the hero image is always above the fold
-            await env.AGP_STATE.put("LCP_IMAGE_URL", "/assets/image/hero.avif");
-            console.log("LCP URL: fallback to hero.avif");
-        }
+        // 1. Save LCP Image URL — hardcoded to hero.avif (always above-fold, always an <img>)
+        // This is the real LCP candidate PSI measures, not the CSS background swap.
+        await env.AGP_STATE.put("LCP_IMAGE_URL", "/assets/image/hero.avif");
+        console.log("LCP URL saved: /assets/image/hero.avif (hardcoded, swap-safe)");
 
         // 2. Build and save GHOST_CSS
         // 🔒 FIX #1 (css): Only set `html` background — never `body`.
