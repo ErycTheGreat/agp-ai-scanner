@@ -10,19 +10,27 @@ async function extractPayload(env) {
 
         console.log("Navigating to site...");
         await page.goto("https://www.eryc.my.id/", {
-            // 🔒 FIX #2: Wait for network to go quiet instead of a fixed 3s timer.
-            // This prevents scraping a half-hydrated Google Sites DOM.
             waitUntil: "networkidle0",
             timeout: 15000
         });
-
-        // Small buffer after networkidle0 for any deferred paint jobs
+        // Small buffer after networkidle0 for deferred paint jobs
         await new Promise(r => setTimeout(r, 1000));
+
+        // Grab the computed background color of the root before stripping the DOM
+        const rootBgColor = await page.evaluate(() => {
+            const computed = window.getComputedStyle(document.documentElement).backgroundColor;
+            const match = computed.match(/\d+/g);
+            if (match && match.length >= 3) {
+                return '#' + match.slice(0, 3).map(n =>
+                    parseInt(n).toString(16).padStart(2, '0')
+                ).join('');
+            }
+            return "#060522";
+        });
 
         const cleanHTML = await page.evaluate(() => {
             document.querySelectorAll('script, style, svg, path, symbol, iframe, noscript').forEach(e => e.remove());
             document.querySelectorAll('div[data-code]').forEach(e => e.remove());
-
             const elements = document.body.getElementsByTagName('*');
             for (let i = 0; i < elements.length; i++) {
                 elements[i].removeAttribute('class');
@@ -33,40 +41,22 @@ async function extractPayload(env) {
             return document.body ? document.body.innerHTML.substring(0, 8000) : "";
         });
 
-        // Also grab the computed background color of the root element for GHOST_CSS
-        const rootBgColor = await page.evaluate(() => {
-            const htmlEl = document.documentElement;
-            const computed = window.getComputedStyle(htmlEl).backgroundColor;
-            // Convert rgb(...) to hex for KV storage
-            const match = computed.match(/\d+/g);
-            if (match && match.length >= 3) {
-                const hex = '#' + match.slice(0, 3).map(n =>
-                    parseInt(n).toString(16).padStart(2, '0')
-                ).join('');
-                return hex;
-            }
-            return "#060522"; // safe fallback matching edge-anti-flash
-        });
-
         console.log("Clean HTML Length:", cleanHTML.length);
         console.log("Root BG Color:", rootBgColor);
         if (cleanHTML.length < 100) throw new Error("Browser grabbed a blank page.");
 
-        // 🔒 WHY NO AI URL DETECTION:
-        // The Puppeteer browser is a real browser — it passes all Engine 2 guards,
-        // so triggerBg() fires and swaps data-heavy-bg into background-image.
-        // The AI then sees the heavy AVIF (homepage-BG.avif) as the prominent image
-        // and writes it to LCP_IMAGE_URL KV. The main worker then preloads that
-        // heavy URL via HTTP header for ALL visitors including PSI — bypassing every
-        // client-side guard. So we never ask AI to detect the LCP URL.
-        const systemPrompt = `You are a strict JSON data extractor. Read the HTML and find the computed background-color of the page root.
+        // AI's only job: confirm or refine the background color.
+        // We do NOT ask AI to detect the LCP URL — the Puppeteer browser fires
+        // Engine 2 (it's a real browser, not PSI), so by the time AI observes the
+        // DOM, the heavy AVIF has already been swapped in. If AI writes that heavy
+        // URL to LCP_IMAGE_URL KV, the main worker preloads it via HTTP header for
+        // everyone including PSI — bypassing every JS guard before the page loads.
+        const systemPrompt = `You are a strict JSON data extractor. Read the HTML and identify the dominant background color of the page.
 Rules:
-- Respond with ONLY this exact JSON object. No preamble, no markdown, no explanation.
-- bgColor must be a valid CSS hex color like "#060522"
-- If unsure, use "#060522"
+- Respond with ONLY this exact JSON object. Zero preamble, zero markdown.
+- bgColor must be a valid CSS hex color e.g. "#060522"
+- If unsure, return the fallback exactly as shown
 {"bgColor": "#060522"}`;
-
-        console.log("Sending Cleaned DOM to AI for bgColor only...");
 
         const aiResponse = await env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
             messages: [
@@ -78,48 +68,37 @@ Rules:
         let rawText = aiResponse.response || "";
         console.log("Raw AI Output:", rawText);
 
-        // Graceful fallback
-        let parsedData = {
-            bgColor: rootBgColor
-        };
+        let bgColor = rootBgColor; // default: real computed value from page
 
         try {
             rawText = rawText.replace(/```json/gi, "").replace(/```/g, "").trim();
             const firstBrace = rawText.indexOf("{");
-            const lastBrace = rawText.lastIndexOf("}");
-
+            const lastBrace  = rawText.lastIndexOf("}");
             if (firstBrace !== -1 && lastBrace !== -1) {
-                const cleanJsonString = rawText.substring(firstBrace, lastBrace + 1);
-                const aiData = JSON.parse(cleanJsonString);
+                const aiData = JSON.parse(rawText.substring(firstBrace, lastBrace + 1));
                 if (aiData.bgColor && /^#[0-9a-fA-F]{3,6}$/.test(aiData.bgColor)) {
-                    parsedData.bgColor = aiData.bgColor;
+                    bgColor = aiData.bgColor;
                 }
-            } else {
-                console.error("AI returned text without JSON. Using computed color fallback.");
             }
         } catch (parseError) {
-            console.error("Failed to parse AI JSON. Using computed color fallback.");
+            console.error("Failed to parse AI JSON — using computed color fallback:", rootBgColor);
         }
 
-        // 1. Save LCP Image URL — hardcoded to hero.avif (always above-fold, always an <img>)
-        // This is the real LCP candidate PSI measures, not the CSS background swap.
+        // 1. LCP Image URL — hardcoded to hero.avif.
+        //    hero.avif is always the real above-fold <img fetchpriority="high"> element.
+        //    It is NOT subject to the bait-and-switch, so the AGP scanner can never
+        //    accidentally write the heavy animation URL to KV.
         await env.AGP_STATE.put("LCP_IMAGE_URL", "/assets/image/hero.avif");
-        console.log("LCP URL saved: /assets/image/hero.avif (hardcoded, swap-safe)");
+        console.log("LCP_IMAGE_URL saved: /assets/image/hero.avif");
 
-        // 2. Build and save GHOST_CSS
-        // 🔒 FIX #1 (css): Only set `html` background — never `body`.
-        // The main worker's edge-anti-flash deliberately sets body to transparent
-        // so the html canvas color shows through. Overriding body here breaks that
-        // trick and causes a color mismatch flash.
-        const safeCss = `
-            html { background-color: ${parsedData.bgColor} !important; }
-            .ghost-skeleton { width: 100vw; height: 100vh; background-color: ${parsedData.bgColor}; }
-        `.trim();
-
+        // 2. GHOST_CSS — only sets `html` background, never `body`.
+        //    The main worker's edge-anti-flash sets body { background: transparent }
+        //    so the html canvas shows through. Overriding body here breaks that trick.
+        const safeCss = `html { background-color: ${bgColor} !important; } .ghost-skeleton { width: 100vw; height: 100vh; background-color: ${bgColor}; }`;
         await env.AGP_STATE.put("GHOST_CSS", safeCss);
-        console.log("GHOST_CSS saved with bgColor:", parsedData.bgColor);
+        console.log("GHOST_CSS saved with bgColor:", bgColor);
 
-        console.log("AGP State Updated Successfully in KV.");
+        console.log("AGP State updated successfully.");
 
     } finally {
         if (browser) {
