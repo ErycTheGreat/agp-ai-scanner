@@ -58,34 +58,10 @@ async function extractPayload(env) {
                 // Filter matches our R2 URL (not gstatic.com) because the
                 // worker already transformed it.
                 // ==========================================================
-                // KEY INSIGHT (from Lighthouse source code):
-                // Lighthouse stops CSS coverage at FCP time, not after a delay.
-                // Waiting 3s lets Google Sites initialize fully → 100% CSS marked
-                // "used" → 1.56 MB captured (useless).
-                // Stopping at FCP captures only rules needed for initial render
-                // → target 2-30 KiB critical CSS.
-                //
-                // STRATEGY CHANGE:
-                // - Critical CSS → inline in HTML via KV (tiny, no render-block)
-                // - Full CSS in R2 → deferred with media=print (non-render-blocking)
-                // - No CLS because critical CSS handles above-fold layout inline
-                console.log("Step 3: Running FCP-timed coverage pass...");
+                console.log("Step 3: Running CSS coverage pass...");
                 await page.coverage.startCSSCoverage();
                 await page.goto("https://www.eryc.my.id/");
-
-                // Stop at FCP — same methodology Lighthouse uses
-                await page.evaluate(() => new Promise((resolve) => {
-                    const observer = new PerformanceObserver((list) => {
-                        if (list.getEntries().find(e => e.name === 'first-contentful-paint')) {
-                            observer.disconnect();
-                            resolve();
-                        }
-                    });
-                    observer.observe({ type: 'paint', buffered: true });
-                    // Safety timeout: if FCP never fires within 8s, stop anyway
-                    setTimeout(resolve, 8000);
-                }));
-
+                await new Promise(r => setTimeout(r, 3000));
                 const cssCoverage = await page.coverage.stopCSSCoverage();
 
                 // Match our R2 URL OR original gstatic URL (handles both states)
@@ -101,21 +77,17 @@ async function extractPayload(env) {
 
                     console.log(`Critical CSS extracted: ${criticalCss.length} bytes (from ${fullCssText.length} bytes)`);
 
-                    if (criticalCss.length > 100 && criticalCss.length < 50000) {
-                        // Small enough to inline — save to KV for HTML injection
-                        await env.AGP_STATE.put("CRITICAL_CSS", criticalCss);
-                        console.log("Critical CSS saved to KV for inlining.");
-                        // Full CSS stays in R2 for deferred (non-blocking) load
-                    } else if (criticalCss.length >= 50000) {
-                        console.log("Critical CSS still too large — FCP fired late. Keeping full CSS strategy.");
-                        await env.AGP_STATE.put("CRITICAL_CSS", "");
+                    if (criticalCss.length > 500) {
+                        // Replace full CSS with critical-only version
+                        await env.MY_ASSETS.put("css/gstatic-cache.css", criticalCss, {
+                            httpMetadata: { contentType: "text/css" }
+                        });
+                        console.log("Critical CSS saved to R2 — replaced full CSS.");
                     } else {
-                        console.log("Critical CSS too small — may be empty. Keeping full CSS strategy.");
-                        await env.AGP_STATE.put("CRITICAL_CSS", "");
+                        console.log("Critical CSS suspiciously small, keeping full CSS as safety net.");
                     }
                 } else {
                     console.log("No CSS coverage entries found — keeping full CSS in R2.");
-                    await env.AGP_STATE.put("CRITICAL_CSS", "");
                 }
             } else {
                 console.log("Failed to fetch gstatic CSS, status:", fullCssRes.status);
