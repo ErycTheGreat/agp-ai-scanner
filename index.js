@@ -151,7 +151,7 @@ async function extractPayload(env) {
         You MUST respond with ONLY this exact JSON format. No other words.
         {"lcpUrl": "insert_url_here", "bgColor": "insert_color_here"}`;
 
-        const aiResponse = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
+        const aiResponse = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fp8', {
             messages: [
                 { role: "system", content: systemPrompt },
                 { role: "user", content: cleanHTML }
