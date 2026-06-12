@@ -1,5 +1,28 @@
 import puppeteer from "@cloudflare/puppeteer";
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Model list — primary first, fallback second.
+// Both are active as of June 2026. Update here if Cloudflare deprecates again.
+// ─────────────────────────────────────────────────────────────────────────────
+const AI_MODELS = [
+    '@cf/zai-org/glm-4.7-flash',         // Cloudflare's recommended fast model
+    '@cf/meta/llama-3.1-8b-instruct-fp8' // Backup — still active, no deprecated tag
+];
+
+async function runAI(env, messages) {
+    for (const model of AI_MODELS) {
+        try {
+            console.log(`Trying AI model: ${model}`);
+            const response = await env.AI.run(model, { messages });
+            console.log(`AI model succeeded: ${model}`);
+            return response;
+        } catch (e) {
+            console.error(`Model ${model} failed: ${e.message}`);
+        }
+    }
+    throw new Error("All AI models failed — check Workers AI model catalog for active models.");
+}
+
 async function extractPayload(env) {
     console.log("Starting Asymmetric Ghost Payload Generation...");
     let browser;
@@ -65,7 +88,7 @@ async function extractPayload(env) {
                 // Stopping at FCP captures only rules needed for initial render
                 // → target 2-30 KiB critical CSS.
                 //
-                // STRATEGY CHANGE:
+                // STRATEGY:
                 // - Critical CSS → inline in HTML via KV (tiny, no render-block)
                 // - Full CSS in R2 → deferred with media=print (non-render-blocking)
                 // - No CLS because critical CSS handles above-fold layout inline
@@ -147,16 +170,19 @@ async function extractPayload(env) {
         console.log("Clean HTML Length:", cleanHTML.length);
         if (cleanHTML.length < 100) throw new Error("Browser grabbed a blank page.");
 
-        const systemPrompt = `You are a strict data parser. Read the HTML and extract the main image URL and background color. 
-        You MUST respond with ONLY this exact JSON format. No other words.
-        {"lcpUrl": "insert_url_here", "bgColor": "insert_color_here"}`;
+        // =================================================================
+        // STEP 5: AI extraction with automatic model fallback
+        // =================================================================
+        console.log("Step 5: Running AI extraction...");
 
-        const aiResponse = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fp8', {
-            messages: [
-                { role: "system", content: systemPrompt },
-                { role: "user", content: cleanHTML }
-            ]
-        });
+        const systemPrompt = `You are a strict data parser. Read the HTML and extract the main image URL and background color. 
+You MUST respond with ONLY this exact JSON format. No other words.
+{"lcpUrl": "insert_url_here", "bgColor": "insert_color_here"}`;
+
+        const aiResponse = await runAI(env, [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: cleanHTML }
+        ]);
 
         let rawText = aiResponse.response || "";
         console.log("Raw AI Output:", rawText);
