@@ -228,9 +228,17 @@ You MUST respond with ONLY this exact JSON format. No other words.
 
 export default {
     async scheduled(event, env, ctx) {
+        // Cron jobs bypass the fetch request, so this runs automatically
         try { await extractPayload(env); } catch (e) { console.error("Cron AI Failed:", e); }
     },
     async fetch(request, env, ctx) {
+        const url = new URL(request.url);
+        
+        // 🔒 SECURITY LOCK: Only run if the URL has ?key=eryc-secure
+        if (url.searchParams.get("key") !== "eryc-secure") {
+            return new Response("Unauthorized", { status: 401 });
+        }
+
         try {
             await extractPayload(env);
             return new Response("AI Scanner executed! Check your KV and R2.", { status: 200 });
