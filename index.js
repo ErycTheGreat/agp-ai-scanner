@@ -62,7 +62,14 @@ async function extractPayload(env) {
             const fullCssRes = await fetch(gstaticHref);
 
             if (fullCssRes.ok) {
-                const fullCssText = await fullCssRes.text();
+                let fullCssText = await fullCssRes.text();
+
+                const originalSize = fullCssText.length;
+                // Strip out all massive base64 embedded fonts and images
+                fullCssText = fullCssText.replace(/url\(['"]?data:[^)]+['"]?\)/g, 'none');
+                console.log(`Cleaned CSS: Dropped from ${originalSize} to ${fullCssText.length} bytes`);
+                // ----------------------------------
+                
                 console.log("Full CSS fetched:", fullCssText.length, "bytes");
 
                 // Save full CSS to R2 as baseline
