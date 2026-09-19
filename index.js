@@ -235,8 +235,11 @@ You MUST respond with ONLY this exact JSON format. No other words.
 
 export default {
     async scheduled(event, env, ctx) {
-        // Cron jobs bypass the fetch request, so this runs automatically
-        try { await extractPayload(env); } catch (e) { console.error("Cron AI Failed:", e); }
+        // ctx.waitUntil forces Cloudflare to keep the Worker alive 
+        // until the Puppeteer session and KV writes are completely finished.
+        ctx.waitUntil(
+            extractPayload(env).catch(e => console.error("Cron AI Failed:", e))
+        );
     },
     async fetch(request, env, ctx) {
         const url = new URL(request.url);
