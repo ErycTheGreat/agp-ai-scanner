@@ -3,7 +3,7 @@ main = "index.js"
 compatibility_date = "2026-04-14"
 compatibility_flags = ["nodejs_compat"]
 
-# Wake up and run every 12 hours
+# Wake up and run / 12 hours
 [triggers]
 crons = ["0 */12 * * *"]
 
