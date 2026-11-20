@@ -37,3 +37,7 @@ Then open `https://agp-scanner-v2.<your-subdomain>.workers.dev/?key=<AGP_KEY>`. 
 
 ## Known limitation
 The live Worker serves everything under `/assets/` with `Cache-Control: immutable` for one year, so a refreshed `gstatic-cache.css` can be served stale. Fixing that means a small change to the live Worker (point the stylesheet swap at `GSTATIC_CSS_PATH`). Not done here on purpose.
+
+## Auto-deploy
+
+This branch is connected to the `agp-scanner-v2` Worker through Cloudflare Workers Builds (root directory `v2`). Pushing here deploys v2.
