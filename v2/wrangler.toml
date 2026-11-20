@@ -2,15 +2,17 @@ name = "agp-scanner-v2"
 main = "scanner.mjs"
 compatibility_date = "2026-04-14"
 
-# Safe by default: MODE="dry" means the cron only reports, it never writes.
-# Switch to "apply" once a manual dry run (?key=...) looks right.
-[vars]
-MODE = "dry"
+# Keep dashboard-only variables when deploying from this file.
+keep_vars = true
 
-# Cron is OFF until you are ready to switch over from v1.
-# When you enable it, delete the cron from v1 (agp-ai-scanner) so they don't both run.
-# [triggers]
-# crons = ["0 */6 * * *"]
+# LIVE settings (match the dashboard). "dry" = report only, "apply" = write.
+[vars]
+MODE = "apply"
+
+# Every 6 hours at :30 UTC. v1 (agp-ai-scanner) runs at 00:00 and 12:00 UTC,
+# so the two never start at the same moment.
+[triggers]
+crons = ["30 */6 * * *"]
 
 # Same bindings as v1. No AI and no Browser binding needed.
 [[kv_namespaces]]
