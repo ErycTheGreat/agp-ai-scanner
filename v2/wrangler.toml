@@ -1,0 +1,27 @@
+name = "agp-scanner-v2"
+main = "scanner.mjs"
+compatibility_date = "2026-04-14"
+
+# Safe by default: MODE="dry" means the cron only reports, it never writes.
+# Switch to "apply" once a manual dry run (?key=...) looks right.
+[vars]
+MODE = "dry"
+
+# Cron is OFF until you are ready to switch over from v1.
+# When you enable it, delete the cron from v1 (agp-ai-scanner) so they don't both run.
+# [triggers]
+# crons = ["0 */6 * * *"]
+
+# Same bindings as v1. No AI and no Browser binding needed.
+[[kv_namespaces]]
+binding = "AGP_STATE"
+id = "9a9985fe64c34f6ea7eb41de408ccbcd"
+
+[[r2_buckets]]
+binding = "MY_ASSETS"
+bucket_name = "eryc-assets"
+
+[observability]
+enabled = true
+
+# Secret (not stored in this file):  npx wrangler secret put AGP_KEY --config v2/wrangler.toml
