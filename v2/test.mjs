@@ -11,6 +11,7 @@ const mkR2 = () => {
   return {
     m,
     get: async (k) => (m.has(k) ? { text: async () => m.get(k) } : null),
+    head: async (k) => (m.has(k) ? { key: k } : null),
     put: async (k, v) => void m.set(k, v),
   };
 };
@@ -61,6 +62,16 @@ const before = e.MY_ASSETS.m.size;
 r = await scan(e, { apply: true });
 assert.equal(r.result, "unchanged");
 assert.equal(e.MY_ASSETS.m.size, before);
+
+// file deleted from R2 (e.g. repo sync --delete) but CSS unchanged: restore it
+const kept = e.MY_ASSETS.m.get("css/gstatic-cache.css");
+e.MY_ASSETS.m.delete("css/gstatic-cache.css");
+r = await scan(e, { apply: true });
+assert.equal(r.result, "updated");
+assert.equal(r.fileExists, false);
+assert.equal(e.MY_ASSETS.m.get("css/gstatic-cache.css"), kept);
+r = await scan(e, { apply: true });
+assert.equal(r.result, "unchanged");
 
 // small change is applied, backup holds the old copy
 const oldCss = e.MY_ASSETS.m.get("css/gstatic-cache.css");

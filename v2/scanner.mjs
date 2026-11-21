@@ -100,12 +100,18 @@ export async function scan(env, { apply = false, force = false } = {}) {
   ]);
   const prevSize = prevSizeRaw ? parseInt(prevSizeRaw, 10) : 0;
 
-  if (prevHash === hash && ready === "ready" && !force) {
+  // The file can disappear from R2 even when Google's CSS is unchanged
+  // (e.g. the repo's R2 sync with --delete). Check it really exists.
+  const fileExists = Boolean(await env.MY_ASSETS.head(R2_LEGACY));
+  report.fileExists = fileExists;
+
+  if (prevHash === hash && ready === "ready" && fileExists && !force) {
     report.result = "unchanged";
     log("CSS unchanged since last run, nothing to do");
     if (apply) await env.AGP_STATE.put("SCAN_STATE", JSON.stringify(report));
     return report;
   }
+  if (!fileExists) log(`${R2_LEGACY} is missing in R2, will restore it`);
 
   // 4. Validate before touching production
   if (bytes < MIN_BYTES || !css.includes("{")) {
